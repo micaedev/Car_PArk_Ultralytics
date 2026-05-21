@@ -6,11 +6,11 @@ use std::process;
 #[cfg(feature = "visualize")]
 use std::time::Duration;
 
-#[cfg(feature = "annotate")]
 use std::fs;
 
 #[cfg(feature = "annotate")]
-use crate::annotate::{annotate_image, find_next_run_dir};
+use crate::annotate::annotate_image;
+use crate::io::find_next_run_dir;
 
 #[cfg(feature = "visualize")]
 use crate::visualizer::Viewer;
@@ -48,6 +48,7 @@ pub fn run_prediction(args: &PredictArgs) {
     let imgsz = args.imgsz;
     let save = args.save;
     let save_frames = args.save_frames;
+    let save_json = args.save_json;
     let half = args.half;
     let verbose = args.verbose;
     let batch_size = args.batch as usize;
@@ -157,14 +158,28 @@ pub fn run_prediction(args: &PredictArgs) {
         |s| crate::source::Source::from(s.as_str()),
     );
 
+    if save_json && model.task() != crate::task::Task::Semantic {
+        warn!(
+            "--save-json is currently supported only for semantic segmentation; ignoring for task '{}'.",
+            model.task()
+        );
+    }
+
+    // Determine whether we need an incremented predict dir. `--save` always needs one
+    // when annotation support is compiled in; semantic class-map export also needs one.
     #[cfg(feature = "annotate")]
-    let save_dir = if save {
+    let need_predict_dir = save || (save_json && model.task() == crate::task::Task::Semantic);
+    #[cfg(not(feature = "annotate"))]
+    let need_predict_dir = save_json && model.task() == crate::task::Task::Semantic;
+
+    let save_dir: Option<std::path::PathBuf> = if need_predict_dir {
         let parent_dir = match model.task() {
             crate::task::Task::Detect => "runs/detect",
             crate::task::Task::Segment => "runs/segment",
             crate::task::Task::Pose => "runs/pose",
             crate::task::Task::Classify => "runs/classify",
             crate::task::Task::Obb => "runs/obb",
+            crate::task::Task::Semantic => "runs/semantic",
         };
         let dir = find_next_run_dir(parent_dir, "predict");
         if let Err(e) = fs::create_dir_all(&dir) {
@@ -175,6 +190,22 @@ pub fn run_prediction(args: &PredictArgs) {
     } else {
         None
     };
+
+    // Per-image semantic class maps go in `<save_dir>/results/<stem>.png`.
+    let results_dir: Option<std::path::PathBuf> = save_dir.as_ref().and_then(|d| {
+        if !save_json || model.task() != crate::task::Task::Semantic {
+            return None;
+        }
+        let dir = d.join("results");
+        if let Err(e) = fs::create_dir_all(&dir) {
+            error!(
+                "Failed to create results directory '{}': {e}",
+                dir.display()
+            );
+            process::exit(1);
+        }
+        Some(dir)
+    });
 
     #[cfg(not(feature = "annotate"))]
     if save {
@@ -240,6 +271,7 @@ pub fn run_prediction(args: &PredictArgs) {
     #[cfg(feature = "annotate")]
     let mut result_saver = save_dir
         .as_ref()
+        .filter(|_| save)
         .map(|d| crate::io::SaveResults::new(d.clone(), save_frames));
     #[cfg(not(feature = "annotate"))]
     let mut result_saver: Option<crate::io::SaveResults> = None;
@@ -318,8 +350,58 @@ pub fn run_prediction(args: &PredictArgs) {
                             );
                         }
 
+                        if let Some(ref cdir) = results_dir
+                            && let Some(ref sm) = result.semantic_mask
+                        {
+                            // For video/webcam sources every frame shares the same path stem,
+                            // so append the frame index to avoid overwriting earlier frames.
+                            let base_stem =
+                                std::path::Path::new(image_path).file_stem().map_or_else(
+                                    || "frame".to_owned(),
+                                    |s| s.to_string_lossy().into_owned(),
+                                );
+                            let stem = if meta.total_frames == Some(1) {
+                                base_stem
+                            } else {
+                                format!("{base_stem}_{:06}", meta.frame_idx)
+                            };
+                            let out_path = cdir.join(format!("{stem}.png"));
+                            let (h, w) = (sm.data.shape()[0], sm.data.shape()[1]);
+                            let max_id = sm.data.iter().copied().max().unwrap_or(0);
+                            if max_id > 255 {
+                                // Class IDs exceed 8-bit range; save as 16-bit grayscale PNG.
+                                warn!(
+                                    "Semantic class IDs exceed 255 (max={max_id}); saving 16-bit PNG: {}",
+                                    out_path.display()
+                                );
+                                let buf: Vec<u16> = sm.data.iter().copied().collect();
+                                if let Some(img16) =
+                                    image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(
+                                        w as u32, h as u32, buf,
+                                    )
+                                    && let Err(e) = img16.save(&out_path)
+                                {
+                                    error!(
+                                        "Failed to save semantic mask '{}': {e}",
+                                        out_path.display()
+                                    );
+                                }
+                            } else {
+                                let buf: Vec<u8> = sm.data.iter().map(|&v| v as u8).collect();
+                                if let Some(gray) =
+                                    image::GrayImage::from_raw(w as u32, h as u32, buf)
+                                    && let Err(e) = gray.save(&out_path)
+                                {
+                                    error!(
+                                        "Failed to save semantic mask '{}': {e}",
+                                        out_path.display()
+                                    );
+                                }
+                            }
+                        }
+
                         #[cfg(feature = "annotate")]
-                        if save_dir.is_some() {
+                        if save {
                             let annotated = annotate_image(img, &result, None);
 
                             if let Some(saver) = &mut result_saver
@@ -449,6 +531,12 @@ fn format_class_counts(
 /// Format detection summary like "4 persons, 1 bus".
 #[allow(clippy::option_if_let_else)]
 fn format_detection_summary(result: &Results) -> String {
+    // Semantic segmentation: report unique class count present in the mask.
+    if let Some(ref sm) = result.semantic_mask {
+        let n = sm.classes_present();
+        return format!("{n} {}", if n == 1 { "class" } else { "classes" });
+    }
+
     let summary = if let Some(ref boxes) = result.boxes {
         format_class_counts(&boxes.cls(), boxes.len(), &result.names)
     } else if let Some(ref obb) = result.obb {
@@ -477,7 +565,7 @@ fn format_detection_summary(result: &Results) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::results::{Boxes, Obb, Probs, Results, Speed};
+    use crate::results::{Boxes, Obb, Probs, Results, SemanticMask, Speed};
     use ndarray::{Array2, Array3};
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -561,6 +649,24 @@ mod tests {
 
         let summary = format_detection_summary(&result);
         assert_eq!(summary, "(no detections)");
+    }
+
+    #[test]
+    fn test_format_summary_semantic_mask() {
+        let mut result = Results::new(
+            create_dummy_image(),
+            "test.jpg".to_string(),
+            create_names(),
+            Speed::default(),
+            (640, 640),
+        );
+        result.semantic_mask = Some(SemanticMask::new(
+            Array2::from_shape_vec((2, 3), vec![0u16, 1, 1, 2, 2, 2]).unwrap(),
+            (2, 3),
+        ));
+
+        let summary = format_detection_summary(&result);
+        assert_eq!(summary, "3 classes");
     }
 
     /// Test `format_detection_summary` with OBB detections.

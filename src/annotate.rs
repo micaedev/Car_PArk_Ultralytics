@@ -35,24 +35,7 @@ pub const fn get_class_color(class_id: usize) -> Rgb<u8> {
 /// until a path that does not yet exist is found.
 #[must_use]
 pub fn find_next_run_dir(base: &str, prefix: &str) -> String {
-    let base_path = Path::new(base);
-
-    // First try without number
-    let first = base_path.join(prefix);
-    if !first.exists() {
-        return first.to_string_lossy().to_string();
-    }
-
-    // Try with incrementing numbers
-    for i in 2.. {
-        let numbered = base_path.join(format!("{prefix}{i}"));
-        if !numbered.exists() {
-            return numbered.to_string_lossy().to_string();
-        }
-    }
-
-    // Fallback (should never reach here)
-    base_path.join(prefix).to_string_lossy().to_string()
+    crate::io::find_next_run_dir(base, prefix)
 }
 
 /// Load an image from `path`, working around a zune-jpeg stride bug for JPEG files.
@@ -153,10 +136,10 @@ pub fn check_font(font: &str) -> Option<PathBuf> {
 
 /// Overlay inference results onto `image` and return the annotated copy.
 ///
-/// Draws whichever result types are present: detection boxes with instance masks,
-/// pose skeletons, oriented bounding boxes, and classification probabilities.
-/// The font (Arial or Arial Unicode for non-ASCII names) is downloaded on first use
-/// and cached locally.
+/// Draws whichever result types are present: semantic segmentation mask, detection boxes
+/// with instance masks, pose skeletons, oriented bounding boxes, and classification
+/// probabilities. The font (Arial or Arial Unicode for non-ASCII names) is downloaded
+/// on first use and cached locally.
 ///
 /// # Arguments
 ///
@@ -191,6 +174,7 @@ pub fn annotate_image(
         .and_then(|data| FontRef::try_from_slice(data).ok());
 
     // Draw all annotations using helpers
+    draw_semantic_mask(&mut img, result);
     draw_detection(&mut img, result, font.as_ref());
     draw_pose(&mut img, result, None, None, None);
     draw_obb(&mut img, result, font.as_ref());
@@ -296,6 +280,37 @@ fn draw_filled_circle(img: &mut image::RgbImage, cx: i32, cy: i32, radius: i32, 
             {
                 img.put_pixel(x as u32, y as u32, color);
             }
+        }
+    }
+}
+
+/// Overlay semantic segmentation class colors at 50% alpha onto `img`.
+///
+/// Each pixel is colorized using `COLORS[class_id % COLORS.len()]` blended 50/50 with
+/// the original pixel. A no-op when `result.semantic_mask` is `None`.
+fn draw_semantic_mask(img: &mut image::RgbImage, result: &Results) {
+    let Some(ref semantic_mask) = result.semantic_mask else {
+        return;
+    };
+    let (width, height) = img.dimensions();
+    let w = width as usize;
+    let mask_data = semantic_mask
+        .data
+        .as_slice()
+        .expect("semantic mask must be contiguous");
+    let pixels = img.as_flat_samples_mut();
+    let buf = pixels.samples;
+    let n_colors = COLORS.len();
+    for y in 0..height as usize {
+        let mask_row = y * w;
+        let img_row = y * w * 3;
+        for x in 0..w {
+            let class_id = mask_data[mask_row + x] as usize;
+            let color = COLORS[class_id % n_colors];
+            let p = img_row + x * 3;
+            buf[p] = (buf[p] / 2).saturating_add(color[0] / 2);
+            buf[p + 1] = (buf[p + 1] / 2).saturating_add(color[1] / 2);
+            buf[p + 2] = (buf[p + 2] / 2).saturating_add(color[2] / 2);
         }
     }
 }

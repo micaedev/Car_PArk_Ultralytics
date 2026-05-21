@@ -55,6 +55,44 @@ impl Speed {
     }
 }
 
+/// Per-pixel class label map for semantic segmentation.
+#[derive(Debug, Clone)]
+pub struct SemanticMask {
+    /// Class index for each pixel, shape [H, W].
+    pub data: Array2<u16>,
+    /// Original image shape (height, width).
+    pub orig_shape: (u32, u32),
+}
+
+impl SemanticMask {
+    /// Create a new `SemanticMask`.
+    #[must_use]
+    pub const fn new(data: Array2<u16>, orig_shape: (u32, u32)) -> Self {
+        Self { data, orig_shape }
+    }
+
+    /// Get the original image shape (height, width).
+    #[must_use]
+    pub const fn orig_shape(&self) -> (u32, u32) {
+        self.orig_shape
+    }
+
+    /// Count unique class IDs present in the mask.
+    #[must_use]
+    pub fn classes_present(&self) -> usize {
+        let mut seen = vec![false; usize::from(u16::MAX) + 1];
+        let mut count = 0;
+        for &v in &self.data {
+            let idx = usize::from(v);
+            if !seen[idx] {
+                seen[idx] = true;
+                count += 1;
+            }
+        }
+        count
+    }
+}
+
 /// Main results container for YOLO inference.
 ///
 /// Contains the original image, detection results (boxes, masks, keypoints, etc.), timing information, and metadata.
@@ -76,6 +114,8 @@ pub struct Results {
     pub probs: Option<Probs>,
     /// Oriented bounding boxes (if applicable).
     pub obb: Option<Obb>,
+    /// Semantic segmentation class map (if applicable).
+    pub semantic_mask: Option<SemanticMask>,
     /// Inference timing information.
     pub speed: Speed,
     /// Class ID to name mapping.
@@ -119,6 +159,7 @@ impl Results {
             keypoints: None,
             probs: None,
             obb: None,
+            semantic_mask: None,
             speed,
             names,
             path,
@@ -129,7 +170,8 @@ impl Results {
     ///
     /// # Returns
     ///
-    /// * The count of detected objects, keyspoints, or masks.
+    /// * The count of detected objects, keypoints, or instance masks.
+    ///   Semantic segmentation masks are per-pixel maps, not detections, so they return 0.
     #[must_use]
     pub fn len(&self) -> usize {
         if let Some(ref boxes) = self.boxes {
@@ -154,7 +196,7 @@ impl Results {
     ///
     /// # Returns
     ///
-    /// * `true` if no objects were detected.
+    /// * `true` if no object-like results were detected.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -187,6 +229,11 @@ impl Results {
     /// * A string summary of detections (e.g., "2 persons, 1 car, ").
     #[must_use]
     pub fn verbose(&self) -> String {
+        if let Some(ref sm) = self.semantic_mask {
+            let n = sm.classes_present();
+            return format!("{n} {}, ", if n == 1 { "class" } else { "classes" });
+        }
+
         if self.is_empty() {
             if self.probs.is_some() {
                 return String::new();
@@ -1011,5 +1058,19 @@ mod tests {
         let results = Results::new(orig_img, "test.jpg".to_string(), names, speed, (640, 640));
         assert!(results.is_empty());
         assert_eq!(results.verbose(), "(no detections), ");
+    }
+
+    #[test]
+    fn test_semantic_mask_has_no_detection_len() {
+        let names = Arc::new(HashMap::from([(0, "background".to_string())]));
+        let speed = Speed::default();
+        let orig_img = Array3::zeros((2, 2, 3));
+        let mut results = Results::new(orig_img, "test.jpg".to_string(), names, speed, (2, 2));
+        results.semantic_mask = Some(SemanticMask::new(array![[0u16, 1], [1, 2]], (2, 2)));
+
+        assert_eq!(results.len(), 0);
+        assert!(results.is_empty());
+        assert_eq!(results.semantic_mask.as_ref().unwrap().classes_present(), 3);
+        assert_eq!(results.verbose(), "3 classes, ");
     }
 }

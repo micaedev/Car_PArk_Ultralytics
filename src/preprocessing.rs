@@ -30,10 +30,6 @@ use image::{DynamicImage, GenericImageView, RgbImage};
 use lru::LruCache;
 use ndarray::{Array3, Array4};
 
-// ================================================================================================
-// Constants
-// ================================================================================================
-
 /// Default letterbox padding color (gray).
 pub const LETTERBOX_COLOR: [u8; 3] = [114, 114, 114];
 
@@ -58,27 +54,15 @@ const INV_255: f32 = 1.0 / 255.0;
 /// Maximum LRU cache size for X coordinate LUTs.
 const LUT_CACHE_SIZE: usize = 8;
 
-// ================================================================================================
-// Type Aliases
-// ================================================================================================
-
 /// X LUT entry: (`x0_byte_offset`, `x1_byte_offset`, 1-fx, fx) using 11-bit fixed-point
 /// weights matching `OpenCV`'s `INTER_LINEAR` coordinate mapping.
 type XLutEntry = (usize, usize, i32, i32);
 type XLutKey = (u32, u32);
 
-// ================================================================================================
-// Thread-Local State
-// ================================================================================================
-
 thread_local! {
     static X_LUT_CACHE: RefCell<LruCache<XLutKey, Vec<XLutEntry>>> =
         RefCell::new(LruCache::new(NonZeroUsize::new(LUT_CACHE_SIZE).unwrap()));
 }
-
-// ================================================================================================
-// Types
-// ================================================================================================
 
 /// Result of preprocessing an image, containing the tensor and transform info.
 #[derive(Debug, Clone)]
@@ -93,6 +77,65 @@ pub struct PreprocessResult {
     pub scale: (f32, f32),
     /// Padding applied (`pad_top`, `pad_left`).
     pub padding: (f32, f32),
+}
+
+/// Build a `PreprocessResult` from a resolved letterbox geometry.
+///
+/// Runs the fused zero-copy resize/pad/normalize, optionally produces an FP16 tensor,
+/// and packages the transform metadata.
+#[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+fn build_preprocess_result(
+    image: &DynamicImage,
+    target_size: (usize, usize),
+    new_w: u32,
+    new_h: u32,
+    pad_left: u32,
+    pad_top: u32,
+    scale: (f32, f32),
+    orig_shape: (u32, u32),
+    half: bool,
+) -> PreprocessResult {
+    let (orig_width, orig_height) = image.dimensions();
+
+    let tensor = match image {
+        DynamicImage::ImageRgb8(rgb) => fused_zerocopy_preprocess(
+            rgb.as_raw(),
+            orig_width,
+            orig_height,
+            target_size,
+            pad_top,
+            pad_left,
+            new_w,
+            new_h,
+        ),
+        _ => {
+            let src_rgb = image.to_rgb8();
+            fused_zerocopy_preprocess(
+                src_rgb.as_raw(),
+                orig_width,
+                orig_height,
+                target_size,
+                pad_top,
+                pad_left,
+                new_w,
+                new_h,
+            )
+        }
+    };
+
+    let tensor_f16 = if half {
+        Some(tensor_f32_to_f16(&tensor))
+    } else {
+        None
+    };
+
+    PreprocessResult {
+        tensor,
+        tensor_f16,
+        orig_shape,
+        scale,
+        padding: (pad_top as f32, pad_left as f32),
+    }
 }
 
 /// Preprocess an image for YOLO inference.
@@ -144,49 +187,17 @@ pub fn preprocess_image_with_precision(
     let (new_width, new_height, pad_left, pad_top, scale) =
         calculate_letterbox_params(orig_width, orig_height, target_size, stride);
 
-    // Zero-copy path: avoid to_rgb8() allocation when possible
-    let tensor = match image {
-        // Fast path: already RGB8, use bytes directly without copy
-        DynamicImage::ImageRgb8(rgb) => fused_zerocopy_preprocess(
-            rgb.as_raw(),
-            orig_width,
-            orig_height,
-            target_size,
-            pad_top,
-            pad_left,
-            new_width,
-            new_height,
-        ),
-        // Fallback: convert to RGB8 (allocates)
-        _ => {
-            let src_rgb = image.to_rgb8();
-            fused_zerocopy_preprocess(
-                src_rgb.as_raw(),
-                orig_width,
-                orig_height,
-                target_size,
-                pad_top,
-                pad_left,
-                new_width,
-                new_height,
-            )
-        }
-    };
-
-    let tensor_f16 = if half {
-        Some(tensor_f32_to_f16(&tensor))
-    } else {
-        None
-    };
-
-    PreprocessResult {
-        tensor,
-        tensor_f16,
-        orig_shape,
+    build_preprocess_result(
+        image,
+        target_size,
+        new_width,
+        new_height,
+        pad_left,
+        pad_top,
         scale,
-        #[allow(clippy::cast_precision_loss)]
-        padding: (pad_top as f32, pad_left as f32),
-    }
+        orig_shape,
+        half,
+    )
 }
 
 // ================================================================================================
@@ -473,12 +484,9 @@ fn calculate_letterbox_params(
     let pad_left = pad_w / 2;
     let pad_top = pad_h / 2;
 
-    // Use a uniform gain for coordinate back-projection.
-    // This matches Ultralytics `scale_boxes()`, which applies a single
-    // `gain = min(target_h / orig_h, target_w / orig_w)` to both axes.
-    // Per-axis gains (`new_w / orig_w`, `new_h / orig_h`) can diverge slightly
-    // after rounding `new_w`/`new_h`, leading to small box shifts and
-    // different NMS results.
+    // Use a single `gain = min(target_h / orig_h, target_w / orig_w)` on both axes for
+    // coordinate back-projection. Per-axis gains computed from rounded `new_w`/`new_h`
+    // can diverge slightly, shifting boxes and changing NMS results.
     (new_w, new_h, pad_left, pad_top, (scale, scale))
 }
 
@@ -725,7 +733,7 @@ fn center_crop_image(image: &DynamicImage, target_size: (usize, usize)) -> (RgbI
     let resized_rgb = RgbImage::from_raw(safe_new_w, safe_new_h, resized_buffer)
         .expect("Failed to create resized buffer");
 
-    // Calculate crop offsets using Banker's Rounding (to match Python round())
+    // Calculate crop offsets using Banker's Rounding (round half to even).
     #[allow(clippy::cast_precision_loss)]
     let crop_x_float = (new_w.saturating_sub(target_w)) as f32 / 2.0;
     #[allow(clippy::cast_precision_loss)]
@@ -743,7 +751,6 @@ fn center_crop_image(image: &DynamicImage, target_size: (usize, usize)) -> (RgbI
 }
 
 /// Round float to nearest integer, rounding half to even (Banker's Rounding).
-/// This matches Python's `round()` behavior.
 fn bankers_round(v: f32) -> f32 {
     let n = v.floor();
     let d = v - n;
@@ -802,5 +809,32 @@ mod tests {
         assert!((clipped[1] - 0.0).abs() < 1e-6);
         assert!((clipped[2] - 640.0).abs() < 1e-6);
         assert!((clipped[3] - 480.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_preprocess_image_static_centered_letterbox() {
+        // 480×640 wide image, target=1024×1024, is_dynamic=false.
+        // Scale = min(1024/480, 1024/640) = 1024/640 = 1.6; nh=768, nw=1024, pad_top≈128.
+        let img = image::DynamicImage::new_rgb8(640, 480);
+        let res = preprocess_image_with_precision(&img, (1024, 1024), 32, false);
+        let (_, _, h, w) = res.tensor.dim();
+        assert_eq!(h, 1024);
+        assert_eq!(w, 1024);
+        // Wide image: horizontal padding is 0, vertical padding is non-zero.
+        assert!(res.padding.1.abs() < 1e-6, "wide image: no left padding");
+        assert!(res.padding.0 > 0.0, "wide image: top padding expected");
+    }
+
+    #[test]
+    fn test_preprocess_image_rect_uses_centered_letterbox() {
+        // Mirrors Ultralytics LetterBox((1024, 1024), auto=True, stride=32) for a 333×640 image:
+        // resized content is 533×1024 and centered in a 544×1024 rect with 5/6 vertical padding.
+        let img = image::DynamicImage::new_rgb8(640, 333);
+        let rect_size = calculate_rect_size(640, 333, (1024, 1024), 32);
+        assert_eq!(rect_size, (544, 1024));
+        let res = preprocess_image_with_precision(&img, rect_size, 32, false);
+        let (_, _, h, w) = res.tensor.dim();
+        assert_eq!((h, w), rect_size);
+        assert_eq!(res.padding, (5.0, 0.0));
     }
 }

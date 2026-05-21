@@ -23,10 +23,11 @@ use wide::{CmpGt, f32x8};
 use fast_image_resize::images::Image;
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use ndarray::{Array2, Array3, ArrayView1, ArrayViewMut2, Zip, s};
+use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 
 use crate::inference::InferenceConfig;
 use crate::preprocessing::{PreprocessResult, clip_coords, scale_coords};
-use crate::results::{Boxes, Keypoints, Masks, Obb, Probs, Results, Speed};
+use crate::results::{Boxes, Keypoints, Masks, Obb, Probs, Results, SemanticMask, Speed};
 use crate::task::Task;
 use crate::utils::{nms_per_class, nms_rotated_per_class};
 
@@ -164,6 +165,10 @@ pub fn postprocess(
         Task::Classify => {
             let (output, _) = &outputs[0];
             postprocess_classify(output, names, orig_img, path, speed, inference_shape)
+        }
+        Task::Semantic => {
+            let (output, shape) = &outputs[0];
+            postprocess_semantic(output, shape, names, orig_img, path, speed, inference_shape)
         }
         Task::Obb => {
             let (output, shape) = &outputs[0];
@@ -1694,6 +1699,278 @@ fn postprocess_obb_end2end(
     results
 }
 
+/// Compute the centered-letterbox crop bounds in model-output (lh, lw) space that
+/// cover the original image (oh, ow).
+///
+/// Returns `(top, left, crop_h, crop_w)` or `None` if the crop is empty (degenerate input).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::similar_names
+)]
+fn letterbox_crop_bounds(
+    lh: usize,
+    lw: usize,
+    oh: usize,
+    ow: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    let gain = (lh as f32 / oh as f32).min(lw as f32 / ow as f32);
+    let pad_h_half = (lh as f32 - (oh as f32 * gain).round()) / 2.0;
+    let pad_w_half = (lw as f32 - (ow as f32 * gain).round()) / 2.0;
+    let top = (pad_h_half - 0.1).round().max(0.0) as usize;
+    let left = (pad_w_half - 0.1).round().max(0.0) as usize;
+    let bottom = lh.saturating_sub((pad_h_half + 0.1).round() as usize);
+    let right = lw.saturating_sub((pad_w_half + 0.1).round() as usize);
+    let crop_h = bottom.saturating_sub(top);
+    let crop_w = right.saturating_sub(left);
+    if crop_h == 0 || crop_w == 0 {
+        None
+    } else {
+        Some((top, left, crop_h, crop_w))
+    }
+}
+
+/// Post-process a Semantic Segmentation ONNX that has ArgMax + Cast(uint8) baked in.
+///
+/// Output shape is `[1, lh, lw] uint8`. For cityscapes-style inputs where the model's
+/// native rect shape matches the source image (lh==oh && lw==ow), this is a single memcpy
+/// into the class map. For other aspect ratios we crop the centered letterbox padding
+/// and nearest-neighbour upsample to original image shape.
+///
+/// # Panics
+///
+/// Panics if the freshly-allocated `Array2<u16>` class map is not contiguous (cannot occur
+/// for `Array2::zeros` on standard layout).
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::similar_names,
+    clippy::implicit_hasher
+)]
+#[must_use]
+pub fn postprocess_semantic_mask(
+    output: &[u8],
+    shape: &[usize],
+    names: Arc<HashMap<usize, String>>,
+    orig_img: Array3<u8>,
+    path: String,
+    speed: Speed,
+    inference_shape: (u32, u32),
+) -> Results {
+    let oh = orig_img.shape()[0];
+    let ow = orig_img.shape()[1];
+    let mut results = Results::new(orig_img, path, names, speed, inference_shape);
+
+    if shape.len() < 2 || output.is_empty() {
+        return results;
+    }
+    let (lh, lw) = (shape[shape.len() - 2], shape[shape.len() - 1]);
+    if lh == 0 || lw == 0 || oh == 0 || ow == 0 {
+        return results;
+    }
+
+    // Model output already at original resolution: just widen u8 -> u16.
+    if lh == oh && lw == ow {
+        let mut buf = vec![0u16; oh * ow];
+        for (dst, &src) in buf.iter_mut().zip(output.iter()) {
+            *dst = u16::from(src);
+        }
+        let class_map = Array2::from_shape_vec((oh, ow), buf).expect("shape matches");
+        results.semantic_mask = Some(SemanticMask::new(class_map, (oh as u32, ow as u32)));
+        return results;
+    }
+
+    // Slow path: crop centered letterbox padding in semantic-mask space, then NN upsample.
+    let Some((top, left, crop_h, crop_w)) = letterbox_crop_bounds(lh, lw, oh, ow) else {
+        return results;
+    };
+
+    let scale_y = crop_h as f32 / oh as f32;
+    let scale_x = crop_w as f32 / ow as f32;
+    let crop_h_minus_1 = crop_h.saturating_sub(1);
+    let crop_w_minus_1 = crop_w.saturating_sub(1);
+    let x_lut: Vec<usize> = (0..ow)
+        .map(|dx| ((dx as f32 + 0.5) * scale_x) as usize)
+        .map(|sx| sx.min(crop_w_minus_1) + left)
+        .collect();
+
+    let mut buf = vec![0u16; oh * ow];
+    buf.par_chunks_mut(ow).enumerate().for_each(|(dy, row)| {
+        let sy = (((dy as f32 + 0.5) * scale_y) as usize).min(crop_h_minus_1) + top;
+        let src_row_base = sy * lw;
+        for (dx, cell) in row.iter_mut().enumerate() {
+            *cell = u16::from(output[src_row_base + x_lut[dx]]);
+        }
+    });
+    let class_map = Array2::from_shape_vec((oh, ow), buf).expect("shape matches");
+    results.semantic_mask = Some(SemanticMask::new(class_map, (oh as u32, ow as u32)));
+    results
+}
+
+/// Post-process semantic segmentation model output.
+///
+/// The model outputs raw logits of shape `[1, nc, lh, lw]` at the P3 scale
+/// (stride 8). Pipeline:
+/// 1. Transpose CHW to HWC once (small: lh*lw*nc f32s) so per-pixel argmax is contiguous.
+/// 2. Bilinear-interpolate each output pixel's 4 source neighbors, fused with argmax
+///    over `nc` classes, producing the final class map in one pass.
+///
+/// Memory traffic per output pixel drops from 4*nc strided reads to 4*nc contiguous
+/// reads; the source channels for one source pixel fit in ~80 bytes (1-2 cache lines).
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::similar_names
+)]
+fn postprocess_semantic(
+    output: &[f32],
+    shape: &[usize],
+    names: Arc<HashMap<usize, String>>,
+    orig_img: Array3<u8>,
+    path: String,
+    speed: Speed,
+    inference_shape: (u32, u32),
+) -> Results {
+    let oh = orig_img.shape()[0];
+    let ow = orig_img.shape()[1];
+    let mut results = Results::new(orig_img, path, names, speed, inference_shape);
+
+    if shape.len() < 4 || output.is_empty() {
+        return results;
+    }
+
+    let nc = shape[1];
+    let lh = shape[2];
+    let lw = shape[3];
+
+    if nc == 0 || nc > usize::from(u16::MAX) + 1 || lh == 0 || lw == 0 || oh == 0 || ow == 0 {
+        return results;
+    }
+
+    // Model output is already at orig_img resolution (no resize, no padding).
+    // Avoids the CHW->HWC transpose and bilinear interpolation entirely: just argmax over
+    // the class channel for each pixel. Hits when the export bakes a full-res upsample
+    // into the ONNX graph and the input was the model's native rect shape.
+    if lh == oh && lw == ow {
+        let plane = lh * lw;
+        let mut buf = vec![0u16; oh * ow];
+        // Load one source row per class at a time so each row fits in cache.
+        // Scratch buffer shared across all rows a given thread processes; one allocation per thread.
+        buf.par_chunks_mut(ow).enumerate().for_each_with(
+            vec![0.0f32; lw],
+            |best_vals, (dy, row)| {
+                if nc == 1 {
+                    let src = &output[dy * lw..(dy + 1) * lw];
+                    for (cell, &v) in row.iter_mut().zip(src.iter()) {
+                        *cell = u16::from(v > 0.0);
+                    }
+                } else {
+                    // Seed best_vals with class 0; row is already zeroed (best_cls = 0).
+                    let src0 = &output[dy * lw..(dy + 1) * lw];
+                    best_vals.copy_from_slice(src0);
+                    for c in 1..nc {
+                        let src_c = &output[c * plane + dy * lw..c * plane + (dy + 1) * lw];
+                        for ((cell, best), &v) in
+                            row.iter_mut().zip(best_vals.iter_mut()).zip(src_c.iter())
+                        {
+                            if v > *best {
+                                *best = v;
+                                *cell = c as u16;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        let class_map = Array2::from_shape_vec((oh, ow), buf).expect("shape matches");
+        results.semantic_mask = Some(SemanticMask::new(class_map, (oh as u32, ow as u32)));
+        return results;
+    }
+
+    // Crop centered letterbox padding, then bilinear-upsample crop to (oh, ow).
+    let plane = lh * lw;
+    let Some((top, left, crop_h, crop_w)) = letterbox_crop_bounds(lh, lw, oh, ow) else {
+        return results;
+    };
+    let scale_y = crop_h as f32 / oh as f32;
+    let scale_x = crop_w as f32 / ow as f32;
+    let lw_minus_1 = lw.saturating_sub(1);
+    let lh_minus_1 = lh.saturating_sub(1);
+
+    // Precompute source-x neighbors + weights once per output column.
+    let x_lut: Vec<(usize, usize, f32, f32)> = (0..ow)
+        .map(|dx| {
+            let sx = (dx as f32 + 0.5).mul_add(scale_x, -0.5).max(0.0) + left as f32;
+            let x0 = (sx.floor() as usize).min(lw_minus_1);
+            let x1 = (x0 + 1).min(lw_minus_1);
+            let fx = sx - x0 as f32;
+            (x0, x1, 1.0 - fx, fx)
+        })
+        .collect();
+
+    // Bilinear upsample and argmax directly on CHW data, skipping the transpose.
+    // Reads are strided (one plane apart per class) but avoids transposing 39M floats.
+    let mut buf = vec![0u16; oh * ow];
+    buf.par_chunks_mut(ow).enumerate().for_each(|(dy, row)| {
+        let sy = (dy as f32 + 0.5).mul_add(scale_y, -0.5).max(0.0) + top as f32;
+        let y0 = (sy.floor() as usize).min(lh_minus_1);
+        let y1 = (y0 + 1).min(lh_minus_1);
+        let fy = sy - y0 as f32;
+        let fyi = 1.0 - fy;
+
+        let row0_base = y0 * lw;
+        let row1_base = y1 * lw;
+
+        for (dx, cell) in row.iter_mut().enumerate() {
+            let (x0, x1, fxi, fx) = x_lut[dx];
+            let w00 = fyi * fxi;
+            let w10 = fy * fxi;
+            let w01 = fyi * fx;
+            let w11 = fy * fx;
+
+            *cell = if nc == 1 {
+                let base = 0;
+                let v = output[base + row1_base + x1].mul_add(
+                    w11,
+                    output[base + row0_base + x1].mul_add(
+                        w01,
+                        output[base + row1_base + x0]
+                            .mul_add(w10, output[base + row0_base + x0] * w00),
+                    ),
+                );
+                u16::from(v > 0.0)
+            } else {
+                let mut best_cls = 0u16;
+                let mut best_val = f32::NEG_INFINITY;
+                for c in 0..nc {
+                    let base = c * plane;
+                    let v = output[base + row1_base + x1].mul_add(
+                        w11,
+                        output[base + row0_base + x1].mul_add(
+                            w01,
+                            output[base + row1_base + x0]
+                                .mul_add(w10, output[base + row0_base + x0] * w00),
+                        ),
+                    );
+                    if v > best_val {
+                        best_val = v;
+                        best_cls = c as u16;
+                    }
+                }
+                best_cls
+            };
+        }
+    });
+    let class_map = Array2::from_shape_vec((oh, ow), buf).expect("shape matches");
+    results.semantic_mask = Some(SemanticMask::new(class_map, (oh as u32, ow as u32)));
+    results
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1989,6 +2266,310 @@ mod tests {
             assert_eq!(data[0], 100.0); // cx
             assert_eq!(data[4], std::f32::consts::FRAC_PI_4); // angle
             assert_eq!(data[5], 0.95); // conf
+        }
+    }
+
+    // --- semantic helpers ---
+
+    fn make_names(nc: usize) -> Arc<HashMap<usize, String>> {
+        Arc::new((0..nc).map(|i| (i, format!("class{i}"))).collect())
+    }
+
+    #[test]
+    fn test_postprocess_semantic_fast_path_argmax() {
+        // 2x2 image, 3 classes, no letterbox (lh==oh, lw==ow).
+        // Verify per-pixel argmax picks the right winning class.
+        let (oh, ow, nc) = (2, 2, 3);
+        let plane = oh * ow;
+        let mut output = vec![0.0f32; nc * plane];
+        // pixel (0,0): class 2 wins
+        output[0] = 0.1;
+        output[plane] = 0.2;
+        output[2 * plane] = 0.9;
+        // pixel (0,1): class 0 wins
+        output[1] = 0.8;
+        output[plane + 1] = 0.1;
+        output[2 * plane + 1] = 0.1;
+        // pixel (1,0): class 1 wins
+        output[2] = 0.3;
+        output[plane + 2] = 0.7;
+        output[2 * plane + 2] = 0.2;
+        // pixel (1,1): class 0 wins
+        output[3] = 0.5;
+        output[plane + 3] = 0.3;
+        output[2 * plane + 3] = 0.3;
+
+        let result = postprocess_semantic(
+            &output,
+            &[1, nc, oh, ow],
+            make_names(nc),
+            ndarray::Array3::zeros((oh, ow, 3)),
+            "test.jpg".to_string(),
+            Speed::default(),
+            (oh as u32, ow as u32),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(sm.data.shape(), &[oh, ow]);
+        assert_eq!(sm.data[[0, 0]], 2);
+        assert_eq!(sm.data[[0, 1]], 0);
+        assert_eq!(sm.data[[1, 0]], 1);
+        assert_eq!(sm.data[[1, 1]], 0);
+        assert_eq!(sm.orig_shape(), (oh as u32, ow as u32));
+    }
+
+    #[test]
+    fn test_postprocess_semantic_binary_fast_path() {
+        // nc=1 (binary segmentation): positive logit → foreground (1), non-positive → background (0).
+        let (oh, ow, nc) = (1, 4, 1);
+        let output = vec![1.0f32, -1.0, 0.001, -0.001];
+        let result = postprocess_semantic(
+            &output,
+            &[1, nc, oh, ow],
+            make_names(2),
+            ndarray::Array3::zeros((oh, ow, 3)),
+            String::new(),
+            Speed::default(),
+            (oh as u32, ow as u32),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(sm.data[[0, 0]], 1);
+        assert_eq!(sm.data[[0, 1]], 0);
+        assert_eq!(sm.data[[0, 2]], 1);
+        assert_eq!(sm.data[[0, 3]], 0);
+    }
+
+    #[test]
+    fn test_postprocess_semantic_binary_zero_logit() {
+        // Exactly 0.0 is not > 0, so it must be treated as background (class 0).
+        let (oh, ow, nc) = (1, 1, 1);
+        let result = postprocess_semantic(
+            &[0.0f32],
+            &[1, nc, oh, ow],
+            make_names(2),
+            ndarray::Array3::zeros((oh, ow, 3)),
+            String::new(),
+            Speed::default(),
+            (oh as u32, ow as u32),
+        );
+        assert_eq!(result.semantic_mask.unwrap().data[[0, 0]], 0);
+    }
+
+    #[test]
+    fn test_postprocess_semantic_large_nc_fast_path() {
+        // nc=33 exceeds the old 32-element stack buffer; verify no panic and correct argmax.
+        let (oh, ow, nc) = (2, 2, 33);
+        let plane = oh * ow;
+        let mut output = vec![0.0f32; nc * plane];
+        for px in 0..plane {
+            output[32 * plane + px] = 1.0; // class 32 wins everywhere
+        }
+        let result = postprocess_semantic(
+            &output,
+            &[1, nc, oh, ow],
+            make_names(nc),
+            ndarray::Array3::zeros((oh, ow, 3)),
+            String::new(),
+            Speed::default(),
+            (oh as u32, ow as u32),
+        );
+        let sm = result.semantic_mask.unwrap();
+        for &val in &sm.data {
+            assert_eq!(val, 32);
+        }
+    }
+
+    #[test]
+    fn test_postprocess_semantic_malformed_shape_no_panic() {
+        let names = make_names(3);
+        let orig_img = ndarray::Array3::zeros((4, 4, 3));
+
+        // Shape too short (needs at least 4 dims)
+        let r = postprocess_semantic(
+            &[0.0f32; 10],
+            &[1, 3],
+            Arc::clone(&names),
+            orig_img.clone(),
+            String::new(),
+            Speed::default(),
+            (4, 4),
+        );
+        assert!(r.semantic_mask.is_none());
+
+        // Empty output slice
+        let r = postprocess_semantic(
+            &[],
+            &[1, 3, 4, 4],
+            Arc::clone(&names),
+            orig_img,
+            String::new(),
+            Speed::default(),
+            (4, 4),
+        );
+        assert!(r.semantic_mask.is_none());
+    }
+
+    #[test]
+    fn test_postprocess_semantic_large_nc_slow_path() {
+        // nc=33 through the letterbox bilinear path (lh!=oh triggers it).
+        // oh=2, ow=4 wide image letterboxed into 8x8:
+        //   gain=2.0, pad rows=2 top+bottom, crop rows 2..6, crop_w=8 (no x padding).
+        let (oh, ow, lh, lw, nc) = (2, 4, 8, 8, 33);
+        let plane = lh * lw;
+        let mut output = vec![0.0f32; nc * plane];
+        for px in 0..plane {
+            output[32 * plane + px] = 1.0; // class 32 wins everywhere in model space
+        }
+        let result = postprocess_semantic(
+            &output,
+            &[1, nc, lh, lw],
+            make_names(nc),
+            ndarray::Array3::zeros((oh, ow, 3)),
+            String::new(),
+            Speed::default(),
+            (lh as u32, lw as u32),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(sm.data.shape(), &[oh, ow]);
+        for &val in &sm.data {
+            assert_eq!(val, 32);
+        }
+    }
+
+    #[test]
+    fn test_postprocess_semantic_binary_slow_path() {
+        // nc=1 binary through the letterbox bilinear path.
+        // oh=2, ow=4 letterboxed into 8x8 (same geometry as above).
+        let (oh, ow, lh, lw, nc) = (2, 4, 8, 8, 1);
+        let mut output = vec![1.0f32; lh * lw]; // all positive → class 1
+        // Flip 4 pixels in the content region (rows 2..6, col 0) to negative
+        for row in 2..6 {
+            output[row * lw] = -1.0;
+        }
+        let result = postprocess_semantic(
+            &output,
+            &[1, nc, lh, lw],
+            make_names(2),
+            ndarray::Array3::zeros((oh, ow, 3)),
+            String::new(),
+            Speed::default(),
+            (lh as u32, lw as u32),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(sm.data.shape(), &[oh, ow]);
+        // Col 0 pixels bilinearly interpolate negative logits → class 0
+        assert_eq!(sm.data[[0, 0]], 0);
+        assert_eq!(sm.data[[1, 0]], 0);
+        // Col 1+ pixels have positive logits → class 1
+        assert_eq!(sm.data[[0, 1]], 1);
+        assert_eq!(sm.data[[1, 1]], 1);
+    }
+
+    #[test]
+    fn test_postprocess_semantic_mask_passthrough() {
+        // Pre-argmaxed u8 output at native resolution: values map 1:1 to u16 class map.
+        let (oh, ow) = (2, 3);
+        let output: Vec<u8> = vec![0, 5, 3, 7, 2, 19];
+        let result = postprocess_semantic_mask(
+            &output,
+            &[oh, ow],
+            make_names(20),
+            ndarray::Array3::zeros((oh, ow, 3)),
+            String::new(),
+            Speed::default(),
+            (oh as u32, ow as u32),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(sm.data.shape(), &[oh, ow]);
+        assert_eq!(sm.data[[0, 0]], 0);
+        assert_eq!(sm.data[[0, 1]], 5);
+        assert_eq!(sm.data[[0, 2]], 3);
+        assert_eq!(sm.data[[1, 0]], 7);
+        assert_eq!(sm.data[[1, 1]], 2);
+        assert_eq!(sm.data[[1, 2]], 19);
+        assert_eq!(sm.orig_shape(), (oh as u32, ow as u32));
+    }
+
+    #[test]
+    fn test_postprocess_semantic_mask_empty_no_panic() {
+        let r = postprocess_semantic_mask(
+            &[],
+            &[4, 4],
+            make_names(10),
+            ndarray::Array3::zeros((4, 4, 3)),
+            String::new(),
+            Speed::default(),
+            (4, 4),
+        );
+        assert!(r.semantic_mask.is_none());
+    }
+
+    #[test]
+    fn test_postprocess_semantic_mask_letterbox_nn_upsample() {
+        // oh=2, ow=4 wide image letterboxed into 8x8.
+        // letterbox_crop_bounds gives top=2, left=0, crop_h=4, crop_w=8.
+        // Content rows 2..6 set to class 7; padding rows 0..2 and 6..8 set to 99.
+        // After NN upsample all orig pixels should map into content → class 7.
+        let (oh, ow, lh, lw) = (2, 4, 8, 8);
+        let mut output = vec![99u8; lh * lw];
+        for row in 2..6 {
+            for col in 0..lw {
+                output[row * lw + col] = 7;
+            }
+        }
+        let result = postprocess_semantic_mask(
+            &output,
+            &[lh, lw],
+            make_names(100),
+            ndarray::Array3::zeros((oh, ow, 3)),
+            String::new(),
+            Speed::default(),
+            (lh as u32, lw as u32),
+        );
+        let sm = result.semantic_mask.unwrap();
+        assert_eq!(sm.data.shape(), &[oh, ow]);
+        for &val in &sm.data {
+            assert_eq!(val, 7, "expected class 7 but got {val}");
+        }
+    }
+
+    #[test]
+    fn test_postprocess_semantic_batch_slice_per_image() {
+        // Simulate the batch-loop slicing in model.rs for a 2-image batch.
+        // Image 0: class 1 wins everywhere. Image 1: class 2 wins everywhere.
+        // Each image is 2×2 with nc=3 logits; batch output is nc*oh*ow per image.
+        let (oh, ow, nc) = (2, 2, 3);
+        let plane = oh * ow;
+        let elems_per_img = nc * plane;
+
+        let mut batch = vec![0.0f32; 2 * elems_per_img];
+        // Image 0 at offset 0: class 1 wins (logit 0.9 at channel 1).
+        for px in 0..plane {
+            batch[plane + px] = 0.9;
+        }
+        // Image 1 at offset elems_per_img: class 2 wins (logit 0.9 at channel 2).
+        for px in 0..plane {
+            batch[elems_per_img + 2 * plane + px] = 0.9;
+        }
+
+        for (i, expected_cls) in [(0usize, 1u16), (1, 2)] {
+            let start = i * elems_per_img;
+            let slice = &batch[start..start + elems_per_img];
+            let result = postprocess_semantic(
+                slice,
+                &[1, nc, oh, ow],
+                make_names(nc),
+                ndarray::Array3::zeros((oh, ow, 3)),
+                String::new(),
+                Speed::default(),
+                (oh as u32, ow as u32),
+            );
+            let sm = result.semantic_mask.unwrap();
+            for &val in &sm.data {
+                assert_eq!(
+                    val, expected_cls,
+                    "image {i}: expected class {expected_cls} but got {val}"
+                );
+            }
         }
     }
 }
